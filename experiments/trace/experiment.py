@@ -8,6 +8,8 @@ from sklearn.naive_bayes import GaussianNB  # type: ignore[import-untyped]
 from sklearn.neighbors import KNeighborsClassifier  # type: ignore[import-untyped]
 from sklearn.tree import DecisionTreeClassifier  # type: ignore[import-untyped]
 from xgboost import XGBClassifier  # type: ignore[import-untyped]
+from sklearn.cluster import AgglomerativeClustering  # type: ignore[import-untyped]
+from sklearn.preprocessing import StandardScaler  # Crucial for clustering
 
 from alpaca.data.timeframe import TimeFrame
 
@@ -201,6 +203,89 @@ def train_xgboost(
     return clf
 
 
+def analyze_wards_clusters(
+        train_df: pd.DataFrame,
+        n_clusters: int = 5,
+        target_column: str = "target"
+) -> pd.DataFrame:
+    X = train_df.drop(columns=[target_column])
+    y = train_df[target_column]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    clusterer = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+    clusters = clusterer.fit_predict(X_scaled)
+
+    results = pd.DataFrame({
+        'cluster': clusters,
+        'target': y
+    })
+
+    cluster_stats = results.groupby('cluster')['target'].agg(['count', 'mean']).reset_index()
+    cluster_stats.columns = ['cluster', 'sample_count', 'win_rate']
+    cluster_stats = cluster_stats.sort_values(by='win_rate', ascending=False)
+
+    return cluster_stats
+
+
+def get_profitable_clusters(data: pd.DataFrame,
+                            n_clusters: int,
+                            min_win_rate: float,
+                            top_n_clusters: int = 3,
+                            max_samples: int = 10000):
+    clean_data = data.dropna().copy()
+    X = clean_data.drop(columns=["target"])
+    y = clean_data["target"]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    if len(X_scaled) > max_samples:
+        indices = np.random.choice(len(X_scaled), max_samples, replace=False)
+        X_cluster = X_scaled[indices]
+        y_cluster = y.iloc[indices]
+    else:
+        X_cluster = X_scaled
+        y_cluster = y
+
+    clusterer = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+    labels = clusterer.fit_predict(X_cluster)
+
+    df_temp = pd.DataFrame({"cluster": labels, "target": y_cluster})
+    cluster_stats = df_temp.groupby("cluster")["target"].mean().sort_values(ascending=False)
+
+    print("\nCluster Win Rates:")
+    print(cluster_stats)
+
+    profitable_ids = cluster_stats[cluster_stats >= min_win_rate].index.tolist()
+
+    if not profitable_ids:
+        print(f"Warning: No clusters met {min_win_rate:.2%}. Using top {top_n_clusters} clusters.")
+        profitable_ids = cluster_stats.head(top_n_clusters).index.tolist()
+
+    cluster_mapper = KNeighborsClassifier(n_neighbors=1)
+    cluster_mapper.fit(X_cluster, labels)
+
+    return scaler, cluster_mapper, profitable_ids
+
+
+def filter_by_cluster(data: pd.DataFrame,
+                      scaler: StandardScaler,
+                      cluster_mapper: KNeighborsClassifier,
+                      profitable_ids: list
+                      ) -> pd.DataFrame:
+    clean_data = data.dropna().copy()
+    if clean_data.empty:
+        return clean_data
+
+    X_scaled = scaler.transform(clean_data.drop(columns=["target"]))
+
+    assigned_clusters = cluster_mapper.predict(X_scaled)
+
+    mask = pd.Series(assigned_clusters).isin(profitable_ids).values
+    return clean_data[mask].copy()
+
 if __name__ == "__main__":
     SYMBOL = "MARA"
     START_DATE = datetime(2022, 1, 1)
@@ -223,51 +308,77 @@ if __name__ == "__main__":
     train_df, test_df = split_training_data(training_df, test_fraction=0.2)
     print(f"Train rows: {len(train_df):,}, test rows: {len(test_df):,}")
 
-    X_train = train_df.drop(columns=["target"])
-    X_test = test_df.drop(columns=["target"])
-    y_test = test_df["target"]
+    be_win_rate = calculate_min_win_rate(TAKE_PROFIT, STOP_LOSS, TRADE_COST)
+    print(f"Filtering for clusters with Win Rate > {be_win_rate:.2%}")
 
-    # Decision tree
-    tree_clf = train_model(train_df)
-    tree_pred = tree_clf.predict(X_test)
-    evaluate_and_print("Decision Tree", y_test, tree_pred)
-
-    # Naive Bayes (Gaussian; features are continuous)
-    nb_clf = train_naive_bayes(train_df)
-    nb_pred = nb_clf.predict(X_test)
-    evaluate_and_print(
-        "Naive Bayes", y_test, nb_pred,
-        take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+    scaler, clusterer, profitable_ids = get_profitable_clusters(
+        train_df,
+        n_clusters=25,
+        min_win_rate=be_win_rate,
+        top_n_clusters=5
     )
 
-    # K-Nearest Neighbors
-    knn_clf = train_knn(train_df)
-    knn_pred = knn_clf.predict(X_test)
-    evaluate_and_print(
-        "K-Nearest Neighbors", y_test, knn_pred,
-        take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
-    )
+    print(f"Profitable Clusters Found: {profitable_ids}")
 
-    # Random forest
-    forest_clf = train_forest(train_df)
-    forest_pred = forest_clf.predict(X_test)
-    evaluate_and_print(
-        "Random Forest", y_test, forest_pred,
-        take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
-    )
+    train_df_filtered = filter_by_cluster(train_df, scaler, clusterer, profitable_ids)
+    test_df_filtered = filter_by_cluster(test_df, scaler, clusterer, profitable_ids)
 
-    # AdaBoost
-    adaboost_clf = train_adaboost(train_df)
-    adaboost_pred = adaboost_clf.predict(X_test)
-    evaluate_and_print(
-        "AdaBoost", y_test, adaboost_pred,
-        take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
-    )
+    print(f"Original Train Rows: {len(train_df):,}")
+    print(f"Filtered Train Rows: {len(train_df_filtered):,}")
+    print(f"Filtered Test Rows: {len(test_df_filtered):,}")
 
-    # XGBoost
-    xgb_clf = train_xgboost(train_df)
-    xgb_pred = xgb_clf.predict(X_test)
-    evaluate_and_print(
-        "XGBoost", y_test, xgb_pred,
-        take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
-    )
+    if len(train_df_filtered) < 10:
+        print("Error: Not enough data left after filtering clusters.")
+    else:
+        # 1. Define Training Sets (Filtered)
+        X_train_f = train_df_filtered.drop(columns=["target"])
+        y_train_f = train_df_filtered["target"]
+
+        # 2. Define Testing Sets (Filtered)
+        X_test_f = test_df_filtered.drop(columns=["target"])
+        y_test_f = test_df_filtered["target"]
+
+        # Decision tree
+        tree_clf = train_model(train_df)
+        tree_pred = tree_clf.predict(X_test_f)
+        evaluate_and_print("Decision Tree", y_test_f, tree_pred)
+
+        # Naive Bayes (Gaussian; features are continuous)
+        nb_clf = train_naive_bayes(train_df)
+        nb_pred = nb_clf.predict(X_test_f)
+        evaluate_and_print(
+            "Naive Bayes", y_test_f, nb_pred,
+            take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+        )
+
+        # K-Nearest Neighbors
+        knn_clf = train_knn(train_df)
+        knn_pred = knn_clf.predict(X_test_f)
+        evaluate_and_print(
+            "K-Nearest Neighbors", y_test_f, knn_pred,
+            take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+        )
+
+        # Random forest
+        forest_clf = train_forest(train_df)
+        forest_pred = forest_clf.predict(X_test_f)
+        evaluate_and_print(
+            "Random Forest", y_test_f, forest_pred,
+            take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+        )
+
+        # AdaBoost
+        adaboost_clf = train_adaboost(train_df)
+        adaboost_pred = adaboost_clf.predict(X_test_f)
+        evaluate_and_print(
+            "AdaBoost", y_test_f, adaboost_pred,
+            take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+        )
+
+        # XGBoost
+        xgb_clf = train_xgboost(train_df)
+        xgb_pred = xgb_clf.predict(X_test_f)
+        evaluate_and_print(
+            "XGBoost", y_test_f, xgb_pred,
+            take_profit=TAKE_PROFIT, stop_loss=STOP_LOSS, cost=TRADE_COST,
+        )
